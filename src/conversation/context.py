@@ -1,30 +1,31 @@
 import logging
 from typing import Any, Hashable
-from src.conversation.action import action
+from src.conversation.action import Action
 from src.http.communication_constants import communication_constants
 from src.conversation.conversation_log import conversation_log
 from src.characters_manager import Characters
-from src.remember.remembering import remembering
+from src.remember.remembering import Remembering
 from src import utils
 from src.utils import get_time_group
 from src.character_manager import Character
 from src.config.config_loader import ConfigLoader
 from src.llm.llm_client import LLMClient
+from src.config.definitions.game_definitions import GameEnum
 
-class context:
+class Context:
     """Holds the context of a conversation
     """
     TOKEN_LIMIT_PERCENT: float = 0.45
 
     @utils.time_it
-    def __init__(self, world_id: str, config: ConfigLoader, client: LLMClient, rememberer: remembering, language: dict[Hashable, str]) -> None:
+    def __init__(self, world_id: str, config: ConfigLoader, client: LLMClient, rememberer: Remembering, language: dict[Hashable, str]) -> None:
         self.__world_id = world_id
         self.__hourly_time = config.hourly_time
         self.__prev_game_time: tuple[str | None, str] | None = None
         self.__npcs_in_conversation: Characters = Characters()
         self.__config: ConfigLoader = config
         self.__client: LLMClient = client
-        self.__rememberer: remembering = rememberer
+        self.__rememberer: Remembering = rememberer
         self.__language: dict[Hashable, str] = language
         self.__weather: str = ""
         self.__custom_context_values: dict[str, Any] = {}
@@ -32,10 +33,10 @@ class context:
         self.__ingame_events: list[str] = []
         self.__vision_hints: str = ''
         self.__have_actors_changed: bool = False
-        self.__game = config.game
+        self.__game: GameEnum = config.game
 
         self.__prev_location: str | None = None
-        if self.__game == "Fallout4" or self.__game == "Fallout4VR":
+        if self.__game.base_game == GameEnum.FALLOUT4:
             self.__location: str = 'the Commonwealth'
         else:
             self.__location: str = "Skyrim"
@@ -164,7 +165,7 @@ class context:
             if location != '':
                 self.__location = location
             else:
-                if self.__game == "Fallout4" or self.__game == "Fallout4VR":
+                if self.__game.base_game == GameEnum.FALLOUT4:
                     self.__location: str = 'the Commonwealth'
                 else:
                     self.__location: str = "Skyrim"
@@ -308,7 +309,7 @@ class context:
             trust = self.__get_trust(npc)
             relationships.append(f"{trust} to {npc.name}")
         
-        return context.format_listing(relationships)
+        return Context.format_listing(relationships)
        
     @utils.time_it
     def get_character_names_as_text(self, should_include_player: bool) -> str:
@@ -325,7 +326,7 @@ class context:
             keys = self.npcs_in_conversation.get_all_names()
         else:
             keys = self.get_characters_excluding_player().get_all_names()
-        return context.format_listing(keys)
+        return Context.format_listing(keys)
     
     @utils.time_it
     def __get_bios_text(self) -> str:
@@ -355,11 +356,11 @@ class context:
         return " ".join(equipment_descriptions)
     
     @utils.time_it
-    def __get_action_texts(self, actions: list[action]) -> str:
+    def __get_action_texts(self, actions: list[Action]) -> str:
         """Generates the prompt text for the available actions
 
         Args:
-            actions (list[action]): the list of possible actions. Already filtered for conversation type and config choices
+            actions (list[Action]): the list of possible actions. Already filtered for conversation type and config choices
 
         Returns:
             str: the text for the {actions} variable
@@ -370,7 +371,7 @@ class context:
         return result
     
     @utils.time_it
-    def generate_system_message(self, prompt: str, actions_for_prompt: list[action]) -> str:
+    def generate_system_message(self, prompt: str, actions_for_prompt: list[Action]) -> str:
         """Fills the variables in the prompt with the values calculated from the context
 
         Args:
