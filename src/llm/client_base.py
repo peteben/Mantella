@@ -5,7 +5,9 @@ from openai import APIConnectionError, BadRequestError, OpenAI, AsyncOpenAI, Rat
 from openai.types.chat import ChatCompletion
 import time
 import tiktoken
+import json
 import os
+import requests
 from pathlib import Path
 from src.llm.ai_client import AIClient
 from src.llm.message_thread import message_thread
@@ -14,6 +16,7 @@ from src.llm.llm_model_list import LLMModelList
 import src.utils as utils
 from src.telemetry.telemetry import create_span_from_thread
 from src.actions.function_manager import FunctionManager
+from src.llm.claude_cache_connector import ClaudeCacheConnector
 
 logger = utils.get_logger()
 
@@ -34,20 +37,38 @@ class ClientBase(AIClient):
     api_token_limits = {}
     tiktoken_cache_dir = "data"
     os.environ["TIKTOKEN_CACHE_DIR"] = tiktoken_cache_dir
+    
+    _KNOWN_SERVICES: dict[str, str] = {
+        'openai': 'https://api.openai.com/v1',
 
-    def __init__(self, api_url: str, llm: str, llm_params: dict[str, Any] | None, custom_token_count: int, secret_key_files: list[str]) -> None:
+        'openrouter': 'https://openrouter.ai/api/v1',
+        'or': 'https://openrouter.ai/api/v1',
+
+        'nanogpt': 'https://nano-gpt.com/api/v1',
+        'nano': 'https://nano-gpt.com/api/v1',
+
+        'kobold': 'http://127.0.0.1:5001/v1',
+        'koboldcpp': 'http://127.0.0.1:5001/v1',
+
+        'textgenwebui': 'http://127.0.0.1:5000/v1',
+        'text-gen-web-ui': 'http://127.0.0.1:5000/v1',
+        'textgenerationwebui': 'http://127.0.0.1:5000/v1',
+        'text-generation-web-ui': 'http://127.0.0.1:5000/v1',
+    }
+
+    def __init__(self, api_url: str, llm: str, llm_params: dict[str, Any] | None, custom_token_count: int, prompt_caching_enabled: bool = False) -> None:
         '''
         Args:
             api_url (str): The API endpoint URL or a known service name (e.g., 'OpenAI', 'OpenRouter')
             llm (str): The name of the language model to use
             llm_params (dict[str, Any] | None): Additional parameters for the LLM requests (eg temperature, max_tokens)
             custom_token_count (int): A fallback token limit if the model's limit isn't known
-            secret_key_files (list[str]): A list of filenames to search for the API key, in order of priority
+            prompt_caching_enabled (bool): Whether Claude prompt caching is enabled for OpenRouter
         '''
         super().__init__()
         self._generation_lock: Lock = Lock()
         self._model_name: str = llm
-        self._base_url = self.__get_endpoint(api_url)
+        self._base_url = self._get_endpoint(api_url)
         self._startup_async_client: AsyncOpenAI | None = None
         self._request_params: dict[str, Any] | None = llm_params
         self._image_client = None
@@ -55,9 +76,9 @@ class ClientBase(AIClient):
         self._enable_vision_next_call: bool = False
         self._vision_mode: VisionMode = self._determine_vision_mode()
 
-        if 'https' in self._base_url: # Cloud LLM
+        if not utils.is_local_url(self._base_url): # Cloud LLM
             self._is_local: bool = False
-            api_key = ClientBase._get_api_key(secret_key_files)
+            api_key = ClientBase._get_api_key(api_url)
             if api_key:
                 self._api_key = api_key
             else:
@@ -69,6 +90,8 @@ class ClientBase(AIClient):
         referer = "https://art-from-the-machine.github.io/Mantella/"
         xtitle = "Mantella"
         self._header: dict[str, str] = {"HTTP-Referer": referer, "X-Title": xtitle}
+        self._claude_cache = ClaudeCacheConnector()
+        self._caching_enabled: bool = prompt_caching_enabled
         self._token_limit: int = self.__get_token_limit(self._model_name, custom_token_count, self._is_local)
         self._encoding = self.__get_model_encoding(api_url, self._model_name)
 
@@ -185,6 +208,14 @@ class ClientBase(AIClient):
                 request_params = self._request_params
             else:
                 request_params: dict[str, Any] = {}
+
+            # Apply Claude cache breakpoint after all message transformations
+            if self._caching_enabled and self._claude_cache.is_applicable(self._base_url, self._model_name):
+                try:
+                    openai_messages = self._claude_cache.transform_messages(openai_messages)
+                except Exception as e:
+                    logger.debug(f"Claude caching transform failed: {e}")
+
             try:
                 chat_completion = sync_client.chat.completions.create(
                     model=self.model_name,
@@ -269,6 +300,13 @@ class ClientBase(AIClient):
                             # If custom function LLM isn't enabled, let the main LLM handle tool calling as well as text generation
                             request_params["tools"] = tools
                     
+                    # Apply Claude cache breakpoint after all message transformations
+                    if self._caching_enabled and self._claude_cache.is_applicable(self._base_url, self._model_name):
+                        try:
+                            openai_messages = self._claude_cache.transform_messages(openai_messages)
+                        except Exception as e:
+                            logger.debug(f"Claude caching transform failed: {e}")
+
                     # Create async client for main LLM streaming (after function client has run if applicable)
                     if self._startup_async_client:
                         async_client = self._startup_async_client
@@ -346,43 +384,19 @@ class ClientBase(AIClient):
                         await async_client.close()
 
 
+    @classmethod
     @utils.time_it
-    def __get_endpoint(self, api_url_or_name: str) -> str:
-        '''
-        Resolves a service name (eg 'openai', 'koboldcpp') if known, or else assumes the input is a direct URL
-
-        Args:
-            api_url_or_name (str): The service name or the direct API base URL
-
-        Returns:
-            endpoint (str): The resolved API endpoint URL
-        '''
-        endpoints = {
-            'openai': 'https://api.openai.com/v1', # don't set an endpoint, just use the OpenAI default
-            'openrouter': 'https://openrouter.ai/api/v1',
-            'kobold': 'http://127.0.0.1:5001/v1',
-            'textgenwebui': 'http://127.0.0.1:5000/v1',
-        }
-
-        cleaned_api_url_or_name = api_url_or_name.strip().lower().replace(' ', '')
-        if cleaned_api_url_or_name == 'openai':
-            endpoint = endpoints['openai']
-        elif cleaned_api_url_or_name == 'openrouter':
-            endpoint = endpoints['openrouter']
-        elif cleaned_api_url_or_name in ['kobold','koboldcpp']:
-            endpoint = endpoints['kobold']
-        elif cleaned_api_url_or_name in ['textgenwebui','text-gen-web-ui','textgenerationwebui','text-generation-web-ui']:
-            endpoint = endpoints['textgenwebui']
-        else: # if endpoint isn't named, assume it is a direct URL
-            endpoint = api_url_or_name
-
-        return endpoint
+    def _get_endpoint(cls, value: str) -> str:
+        '''Resolve a service name or alias to an endpoint URL.
+        Returns the normalized input as-is if not a known service (assumed to be a direct URL).'''
+        normalized = value.strip().lower().replace(' ', '')
+        return cls._KNOWN_SERVICES.get(normalized, normalized)
     
 
     def __get_llm_priority(self, llm: str, priority: str, api_url: str) -> str:
         '''https://openrouter.ai/docs/features/provider-routing'''
         # Priority is only compatible with OpenRouter
-        if api_url.strip().lower().replace(' ', '') != 'openrouter':
+        if self._get_endpoint(api_url) != 'https://openrouter.ai/api/v1':
             return ''
         
         # Free models cannot have a priority
@@ -399,46 +413,57 @@ class ClientBase(AIClient):
 
     @utils.time_it
     @staticmethod
-    def _get_api_key(key_files: str | list[str], show_error: bool = True) -> str | None:
-        '''
-        Attempts to read an API key from a list of files in order of priority.
+    def _get_api_key(service: str, show_error: bool = True) -> str | None:
+        '''Resolves an API key for the given service.
+
+        Lookup order:
+        1. secret_keys.json in the mod folder
+        2. secret_keys.json next to the executable
+        3. GPT_SECRET_KEY.txt in the mod folder
+        4. GPT_SECRET_KEY.txt next to the executable
 
         Args:
-            key_files (list[str]): A list of file names to check for the API key, in order of priority.
+            service (str): The LLM service name / URL
         '''
-        if isinstance(key_files, str):
-            key_files = [key_files]
-        
         mod_parent_folder = Path(utils.resolve_path()).parent.parent.parent
-        
+        target_service = ClientBase._get_endpoint(service)
+
         api_key = None
-        for key_file in key_files:
-            # try to check the mod folder first
+        for folder in [mod_parent_folder, Path('.')]:
+            json_path = folder / 'secret_keys.json'
             try:
-                with open(mod_parent_folder / key_file, 'r') as f:
-                    api_key = f.readline().strip()
-                    if api_key:
-                        break
-            except (FileNotFoundError, PermissionError):
+                with open(json_path, 'r') as f:
+                    keys_dict: dict = json.load(f)
+                for api_name, api_key_val in keys_dict.items():
+                    if ClientBase._get_endpoint(str(api_name)) == target_service:
+                        matching_api_key = str(api_key_val).strip()
+                        if matching_api_key:
+                            api_key = matching_api_key
+                            break
+                if api_key:
+                    break
+            except (FileNotFoundError, PermissionError, json.JSONDecodeError):
                 pass
-            
-            # try to check locally (same folder as executable)
-            try:
-                with open(key_file, 'r') as f:
-                    api_key = f.readline().strip()
-                    if api_key:
-                        break
-            except (FileNotFoundError, PermissionError):
-                pass
+
+        if not api_key:
+            for folder in [mod_parent_folder, Path('.')]:
+                try:
+                    with open(folder / 'GPT_SECRET_KEY.txt', 'r') as f:
+                        val = f.readline().strip()
+                        if val:
+                            api_key = val
+                            break
+                except (FileNotFoundError, PermissionError):
+                    pass
 
         if not api_key or api_key == '':
                 if show_error:
                     utils.play_error_sound()
-                    logger.critical(f'''No secret key found in GPT_SECRET_KEY.txt.
+                    logger.critical(f'''No secret key found for service '{service}' in GPT_SECRET_KEY.txt.
 Please create a secret key and paste it in your Mantella mod folder's GPT_SECRET_KEY.txt file.
 If you are using OpenRouter (default), you can create a secret key in Account -> Keys once you have created an account: https://openrouter.ai/
 If using OpenAI, see here on how to create a secret key: https://help.openai.com/en/articles/4936850-where-do-i-find-my-openai-api-key
-If you are running a model locally, please ensure the service (eg Kobold / Text generation web UI) is selected and running via: http://localhost:4999/ui
+If you are running a model locally, please ensure the service (eg Kobold / Text generation web UI) is selected and running.
 For more information, see here: https://art-from-the-machine.github.io/Mantella/''')
                     time.sleep(3)
 
@@ -577,8 +602,8 @@ For more information, see here: https://art-from-the-machine.github.io/Mantella/
         return num_tokens
     
     @staticmethod
-    def get_model_list(service: str, secret_key_file: str, default_model: str = "mistralai/mistral-small-3.1-24b-instruct:free", is_vision: bool = False, is_tool_calling: bool = False) -> LLMModelList:
-        if service not in ['OpenAI', 'OpenRouter']:
+    def get_model_list(service: str, default_model: str = "mistralai/mistral-small-3.1-24b-instruct:free", is_vision: bool = False, is_tool_calling: bool = False) -> LLMModelList:
+        if service not in ['OpenAI', 'OpenRouter', 'NanoGPT']:
             return LLMModelList([("Custom model","Custom model")], "Custom model", allows_manual_model_input=True)
         try:
             if service == "OpenAI":
@@ -588,49 +613,117 @@ For more information, see here: https://art-from-the-machine.github.io/Mantella/
                 allow_manual_model_input = True
             elif service == "OpenRouter":
                 default_model = default_model
-                secret_key_files = [secret_key_file, 'GPT_SECRET_KEY.txt'] if secret_key_file != 'GPT_SECRET_KEY.txt' else [secret_key_file]
                 show_error = not is_vision and not is_tool_calling # Only show error for base LLM
-                secret_key = ClientBase._get_api_key(secret_key_files, show_error=show_error)
+                secret_key = ClientBase._get_api_key("OpenRouter", show_error=show_error)
                 if not secret_key:
-                    return LLMModelList([(f"No secret key found in {secret_key_file}", "Custom model")], "Custom model", allows_manual_model_input=True)
+                    return LLMModelList([(f"No secret key found for OpenRouter", "Custom model")], "Custom model", allows_manual_model_input=True)
                 # NOTE: while a secret key is not needed for this request, this may change in the future
                 client = OpenAI(api_key=secret_key, base_url='https://openrouter.ai/api/v1')
                 # don't log initial 'HTTP Request: GET https://openrouter.ai/api/v1/models "HTTP/1.1 200 OK"'
                 models = client.models.list()
                 client.close()
                 allow_manual_model_input = False
+            elif service == "NanoGPT":
+                default_model = "mistral-small-31-24b-instruct"
+                show_error = not is_vision and not is_tool_calling # Only show error for base LLM
+                secret_key = ClientBase._get_api_key("NanoGPT", show_error=show_error)
+                if not secret_key:
+                    return LLMModelList([(f"No secret key found for NanoGPT", "Custom model")], "Custom model", allows_manual_model_input=True)
+                
+                # Use requests to call NanoGPT with detailed=true parameter
+                # (the OpenAI SDK's models.list() doesn't support the ?detailed=true query param
+                #  needed to get pricing, context length, and capabilities data)
+                headers = {"Authorization": f"Bearer {secret_key}"}
+                url = "https://nano-gpt.com/api/v1/models?detailed=true"
+                response = requests.get(url, headers=headers)
+                
+                if response.status_code != 200:
+                    raise Exception(f"NanoGPT API returned status {response.status_code}: {response.text}")
+                
+                models_data = response.json()
+                allow_manual_model_input = False
 
             options = []
             multiplier = 1_000_000
-            for model in models.data:
-                try:
-                    if model.model_extra:
-                        context_size: int = model.model_extra["context_length"]
-                        prompt_cost: float = float(model.model_extra["pricing"]["prompt"]) * multiplier
-                        completion_cost: float = float(model.model_extra["pricing"]["completion"]) * multiplier
-                        vision_available: str = ' | ✅ Vision' if model.model_extra["architecture"]["modality"] == 'text+image->text' else ''
-                        tool_calling_available: str = ' | ✅ Advanced Actions' if 'tools' in model.model_extra['supported_parameters'] else ''
-                        reasoning_model: str = ' | ⚠️ Reasoning' if 'reasoning' in model.model_extra['supported_parameters'] else ''
-                        model_display_name = f"{model.id} | Context: {utils.format_context_size(context_size)} | Cost per 1M tokens: Prompt: {utils.format_price(prompt_cost)}. Completion: {utils.format_price(completion_cost)}{vision_available}{tool_calling_available}{reasoning_model}"
 
-                        ClientBase.api_token_limits[model.id.split('/')[-1]] = context_size
-                    else:
+            # Handle different response formats based on service
+            if service == "NanoGPT":
+                # NanoGPT returns detailed JSON response directly
+                models_list = models_data.get("data", [])
+                for model in models_list:
+                    try:
+                        model_id = model.get("id", "unknown")
+                        model_name = model.get("name", model_id)
+                        context_size = model.get("context_length", 0)
+                        pricing = model.get("pricing", {})
+                        capabilities = model.get("capabilities", {})
+                        
+                        # Always try to show detailed information, even if some parts are missing
+                        model_display_parts = [f"{model_name} ({model_id})"]
+                        
+                        # Add context size if available
+                        if context_size and context_size > 0:
+                            model_display_parts.append(f"Context: {utils.format_context_size(context_size)}")
+                            ClientBase.api_token_limits[model_id.split('/')[-1]] = context_size
+                        
+                        # Add pricing if available (NanoGPT prices are already in USD per million tokens)
+                        if pricing:
+                            prompt_cost = float(pricing.get("prompt", 0))
+                            completion_cost = float(pricing.get("completion", 0))
+                            
+                            if prompt_cost >= 0 or completion_cost >= 0:
+                                cost_parts = []
+                                cost_parts.append(f"Prompt: {utils.format_price(prompt_cost)}")
+                                cost_parts.append(f"Completion: {utils.format_price(completion_cost)}")
+                                model_display_parts.append(f"Cost per 1M tokens: {'. '.join(cost_parts)}")
+                        
+                        # Add capability markers using the capabilities field
+                        if capabilities.get("vision"):
+                            model_display_parts.append("✅ Vision")
+                        if capabilities.get("tool_calling"):
+                            model_display_parts.append("✅ Advanced Actions")
+                        if capabilities.get("reasoning"):
+                            model_display_parts.append("⚠️ Reasoning")
+                        
+                        # Join all available parts with " | "
+                        model_display_name = " | ".join(model_display_parts)
+                     
+                    except Exception as e:
+                        # Fallback to model ID if parsing fails
+                        model_display_name = model.get("id", "unknown")
+                    
+                    options.append((model_display_name, model.get("id", "unknown")))
+            else:
+                # OpenRouter and OpenAI use the existing models.data format
+                for model in models.data:
+                    try:
+                        if model.model_extra:
+                            context_size: int = model.model_extra["context_length"]
+                            prompt_cost: float = float(model.model_extra["pricing"]["prompt"]) * multiplier
+                            completion_cost: float = float(model.model_extra["pricing"]["completion"]) * multiplier
+                            vision_available: str = ' | ✅ Vision' if model.model_extra["architecture"]["modality"] == 'text+image->text' else ''
+                            tool_calling_available: str = ' | ✅ Advanced Actions' if 'tools' in model.model_extra['supported_parameters'] else ''
+                            reasoning_model: str = ' | ⚠️ Reasoning' if 'reasoning' in model.model_extra['supported_parameters'] else ''
+                            model_display_name = f"{model.id} | Context: {utils.format_context_size(context_size)} | Cost per 1M tokens: Prompt: {utils.format_price(prompt_cost)}. Completion: {utils.format_price(completion_cost)}{vision_available}{tool_calling_available}{reasoning_model}"
+
+                            ClientBase.api_token_limits[model.id.split('/')[-1]] = context_size
+                        else:
+                            model_display_name = model.id
+                    except:
                         model_display_name = model.id
-                except:
-                    model_display_name = model.id
-                options.append((model_display_name, model.id))
+                    options.append((model_display_name, model.id))
             
             # check if any models are marked as vision-capable
-            has_vision_models = any(' | ✅ Vision' in name for name, _ in options)
+            has_vision_models = any('✅ Vision' in name for name, _ in options)
             # filter model list if this is supposed to be a vision model list and there are models explicitly marked as such
             if is_vision and has_vision_models:
-                options = [(name, model_id) for name, model_id in options if ' | ✅ Vision' in name]
+                options = [(name, model_id) for name, model_id in options if '✅ Vision' in name]
 
             # check if any models are marked as tool-calling-capable
-            has_tool_calling_models = any(' | ✅ Advanced Actions' in name for name, _ in options)
-            # filter model list if this is supposed to be a vision model list and there are models explicitly marked as such
+            has_tool_calling_models = any('✅ Advanced Actions' in name for name, _ in options)
+            # filter model list if this is supposed to be a tool-calling model list and there are models explicitly marked as such
             if is_tool_calling and has_tool_calling_models:
-                options = [(name, model_id) for name, model_id in options if ' | ✅ Advanced Actions' in name]
+                options = [(name, model_id) for name, model_id in options if '✅ Advanced Actions' in name]
             
             return LLMModelList(options, default_model, allows_manual_model_input=allow_manual_model_input)
         except Exception as e:
